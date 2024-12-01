@@ -38,6 +38,9 @@ parser.add_argument('--lr', '--learning-rate', default=0.05, type=float,
                     metavar='LR', help='initial (base) learning rate', dest='lr')
 parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
                     help='momentum of SGD solver')
+parser.add_argument('--wd', '--weight-decay', default=1e-4, type=float,
+                    metavar='W', help='weight decay (default: 1e-4)',
+                    dest='weight_decay')
 parser.add_argument('--input-size', default=256, type=int)
 parser.add_argument('--memory-size', default=10000, type=int)
 parser.add_argument('--log', default='log.txt', type=str, metavar='PATH')
@@ -346,17 +349,18 @@ class AverageMeter(object):
 
 def train(args):
     model = MyNet(models.__dict__['resnet50'])
-    init_weights(model)
+    # init_weights(model)
 
     model.cuda()
 
     loss_fn = losses.ContrastiveLoss(pos_margin=0.0, neg_margin=1.0)
     loss_fn = losses.CrossBatchMemory(loss_fn, embedding_size=256, memory_size=args.memory_size)
 
-    optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum)
+    init_lr = args.lr
+    optimizer = torch.optim.SGD(model.parameters(), lr=init_lr, momentum=args.momentum, weight_decay=args.weight_decay)
 
     # 数据集目录
-    data_path = list(Path(args.data).glob('**/*.jpg'))[:1000]
+    data_path = list(Path(args.data).glob('**/*.jpg'))
 
     # 复合数据增强
     aug_moderate = [
@@ -407,6 +411,7 @@ def train(args):
     log = open(args.log, mode='w')
 
     for epoch in range(args.epochs):
+        adjust_learning_rate(optimizer, init_lr, epoch, args)
         train_one_epoch(train_loader, model, loss_fn, optimizer, epoch, log)
 
     torch.save(model.state_dict(), "model.pth")
@@ -439,6 +444,15 @@ def train_one_epoch(train_loader, model, loss_fn, optimizer, epoch, log):
         progress.set_postfix(loss=losses.avg)
 
     log.write(f'epoch={epoch}, loss={losses.avg}\n')
+
+def adjust_learning_rate(optimizer, init_lr, epoch, args):
+    """Decay the learning rate based on schedule"""
+    cur_lr = init_lr * (1 - (epoch / args.epochs))
+    for param_group in optimizer.param_groups:
+        if 'fix_lr' in param_group and param_group['fix_lr']:
+            param_group['lr'] = init_lr
+        else:
+            param_group['lr'] = cur_lr
 
 
 if __name__ == '__main__':
