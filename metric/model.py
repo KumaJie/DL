@@ -11,7 +11,7 @@ def create_model(weight: str):
 
     preprocessor = transforms.Compose(
         [
-            transforms.Resize((512, 512)),
+            transforms.Resize((256, 256)),
             transforms.ToTensor(),
             transforms.Normalize(
                 mean=(0.5, 0.5, 0.5),

@@ -10,7 +10,7 @@ def initCollection(collectionName: str):
     connections.connect("default", host="localhost", port="19530")
     fields = [
         FieldSchema(name="pk", dtype=DataType.INT64, is_primary=True, auto_id=False, max_length=100),
-        FieldSchema(name="embeddings", dtype=DataType.FLOAT_VECTOR, dim=256)
+        FieldSchema(name="embeddings", dtype=DataType.FLOAT_VECTOR, dim=1000)
     ]
     schema = CollectionSchema(fields=fields)
     collection = Collection(collectionName, schema)

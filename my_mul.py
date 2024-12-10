@@ -1,19 +1,21 @@
 import argparse
+import builtins
 import os
 import pickle
 import random
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import numpy as np
 import timm
 import torch
-import torchvision.models as models
+
 import torchvision.transforms as transforms
 import torch.nn.functional as F
 import torch.nn as nn
 import torch.utils.data
-from PIL.features import features
+from torch.backends import cudnn
+import torch.multiprocessing as mp
+import torch.distributed as dist
 
 from augly.image import (EncodingQuality, OneOf,
                          RandomBlur, RandomEmojiOverlay, RandomPixelization,
@@ -26,11 +28,15 @@ from augly.utils.constants import FONT_LIST_PATH, FONTS_DIR, SMILEY_EMOJI_DIR
 
 from PIL import Image, ImageFilter
 from pytorch_metric_learning import losses
+from pytorch_metric_learning.utils import distributed as pml_dist
+
 from tqdm import tqdm
 
 parser = argparse.ArgumentParser(description='training')
 parser.add_argument('data', metavar='DIR',
                     help='path to dataset')
+parser.add_argument('--seed', default=None, type=int,
+                    help='seed for initializing training. ')
 parser.add_argument('--epochs', default=100, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('-b', '--batch-size', default=128, type=int,
@@ -48,8 +54,6 @@ parser.add_argument('--wd', '--weight-decay', default=1e-4, type=float,
 parser.add_argument('--input-size', default=256, type=int)
 parser.add_argument('--memory-size', default=10000, type=int)
 parser.add_argument('--log', default='log.txt', type=str, metavar='PATH')
-parser.add_argument('--pretrained', default='', type=str)
-
 
 
 # 数据增强部分
@@ -283,22 +287,6 @@ class MyNet(nn.Module):
         return x
 
 
-# 使用预训练参数
-def init_weights(args, model):
-    model_dict = model.state_dict()
-
-    weights_path = args.pretrained
-    state_dict = torch.load(weights_path)
-
-    sd = {}
-    for k, v in state_dict['state_dict'].items():
-        layer = k.replace('module.encoder_q.', 'backbone.')
-        if layer in model_dict:
-            sd[layer] = v
-    model_dict.update(sd)
-    model.load_state_dict(model_dict)
-
-
 # 自定义数据集产生
 class MyDataset(torch.utils.data.Dataset):
     def __init__(
@@ -357,20 +345,63 @@ class AverageMeter(object):
 
 
 def train(args):
+    if args.seed is not None:
+        random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        cudnn.deterministic = True
+
+    args.distributed = args.world_size > 1 or args.multiprocessing_distributed
+    ngpus_per_node = torch.cuda.device_count()
+    if args.multiprocessing_distributed:
+        # Since we have ngpus_per_node processes per node, the total world_size
+        # needs to be adjusted accordingly
+        args.world_size = ngpus_per_node * args.world_size
+        # Use torch.multiprocessing.spawn to launch distributed processes: the
+        # main_worker process function
+        mp.spawn(main_worker, nprocs=ngpus_per_node, args=(ngpus_per_node, args))
+
+
+def main_worker(gpu, ngpus_per_node, args):
+    args.gpu = gpu
+
+    # suppress printing if not master
+    if args.multiprocessing_distributed and args.gpu != 0:
+        def print_pass(*args):
+            pass
+
+        builtins.print = print_pass
+
+    if args.distributed:
+
+        args.rank = args.rank * ngpus_per_node + gpu
+        dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
+                                world_size=args.world_size, rank=args.rank)
+        torch.distributed.barrier(device_ids=[args.gpu])
+
     backbone = timm.create_model('mobilenetv3_small_050', features_only=True, pretrained=True)
     model = MyNet(backbone)
-    if args.pretrained != '':
-        init_weights(args, model)
 
-    model.cuda()
+    if args.distributed:
+        # Apply SyncBN
+        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+
+        torch.cuda.set_device(args.gpu)
+        model.cuda(args.gpu)
+
+        args.batch_size = int(args.batch_size / ngpus_per_node)
+        args.workers = int((args.workers + ngpus_per_node - 1) / ngpus_per_node)
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
+
+
     # 损失函数
-    # loss_fn = losses.ContrastiveLoss(pos_margin=0.0, neg_margin=1.0)
-    loss_fn = losses.NTXentLoss(temperature=0.5)
+    loss_fn = losses.ContrastiveLoss(pos_margin=0.0, neg_margin=1.0)
+    # loss_fn = losses.NTXentLoss(temperature=0.5)
     loss_fn = losses.CrossBatchMemory(loss_fn, embedding_size=256, memory_size=args.memory_size)
+    loss_fn = pml_dist.DistributedLossWrapper(loss=loss_fn)
 
     init_lr = args.lr
     optimizer = torch.optim.SGD(model.parameters(), lr=init_lr, momentum=args.momentum, weight_decay=args.weight_decay)
-
+    scaler = torch.cuda.amp.GradScaler()
     # 数据集目录
     data_path = list(Path(args.data).glob('**/*.jpg'))
 
@@ -418,45 +449,63 @@ def train(args):
             ncrops=2
         )
     )
+    train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
 
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True)
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
+                                               num_workers=args.workers, pin_memory=True, sampler=train_sampler, drop_last=True)
 
-    log = open(args.log, mode='w')
 
     for epoch in range(args.epochs):
+        train_sampler.set_epoch(epoch)
         adjust_learning_rate(optimizer, init_lr, epoch, args)
-        train_one_epoch(train_loader, model, loss_fn, optimizer, epoch, log)
+        train_one_epoch(train_loader, model, loss_fn, optimizer, scaler, epoch, args)
+
+        if args.multiprocessing_distributed and args.rank % ngpus_per_node == 0:
+            save_checkpoint({
+                'epoch': epoch + 1,
+                'state_dict': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'args': args,
+            }, filename=f'/train/checkpoint_{epoch:04d}.pth.tar')
 
     torch.save(model.state_dict(), "model.pth")
-    log.close()
 
 
-def train_one_epoch(train_loader, model, loss_fn, optimizer, epoch, log):
+def train_one_epoch(train_loader, model, loss_fn, optimizer, scaler, epoch, args):
     losses = AverageMeter('Loss', ':.3f')
     progress = tqdm(train_loader, desc=f'epoch {epoch}', leave=False, total=len(train_loader))
 
     model.train()
 
     for labels, images in progress:
-        labels = labels.cuda()
+        optimizer.zero_grad()
+
+        labels = labels.cuda(args.gpu, non_blocking=True)
         # 重复标签
         labels = torch.tile(labels, dims=(2,))
         # 数组增强后会得到一对 Key 和 Query，展平Batch
-        images = torch.cat(images, dim=0).cuda()
+        images = torch.cat([
+            image for image in images
+        ], dim=0).cuda(args.gpu, non_blocking=True)
 
-        embeddings = model(images)
-        loss = loss_fn(embeddings, labels)
+        with torch.cuda.amp.autocast():
+            embeddings = model(images)
+            loss = loss_fn(embeddings, labels)
 
         losses.update(loss.item(), images.size(0))
 
         # 反向传播
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
         progress.set_postfix(loss=losses.avg)
 
-    log.write(f'epoch={epoch}, loss={losses.avg}\n')
+
+def save_checkpoint(state, filename='checkpoint.pth.tar'):
+    torch.save(state, filename)
+
+
 
 def adjust_learning_rate(optimizer, init_lr, epoch, args):
     """Decay the learning rate based on schedule"""
@@ -471,5 +520,3 @@ def adjust_learning_rate(optimizer, init_lr, epoch, args):
 if __name__ == '__main__':
     args = parser.parse_args()
     train(args)
-
-

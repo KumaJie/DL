@@ -37,5 +37,5 @@ if __name__ == '__main__':
                 if query // 4 == match // 4:
                     record[query, j] = 1
                     cnt += 1
-    np.save('query.npy', record)
+    np.save('query_resnet50.npy', record)
     print(float(cnt / len(src_paths)))
